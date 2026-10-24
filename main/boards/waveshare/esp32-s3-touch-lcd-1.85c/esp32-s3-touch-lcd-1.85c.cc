@@ -222,8 +222,8 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
 
 // ---------------------------------------------------------------------------
 // Cooper: escucha un aviso UDP de la PC ("COOPER:<texto>") en el puerto 41234
-// y despierta al asistente como si hubiera oído la palabra de activación,
-// enviando <texto> al servidor para que responda (por ejemplo, un saludo).
+// y despierta al asistente como si hubiera oído la palabra de activación.
+// El saludo lo hace el agente (rol configurado en la consola de XiaoZhi).
 // ---------------------------------------------------------------------------
 #define COOPER_WAKE_PORT 41234
 #define COOPER_WAKE_PREFIX "COOPER:"
@@ -280,21 +280,17 @@ static void CooperWakeListenerTask(void* arg) {
                 continue;
             }
 
-            // Limpiar el texto (sin comillas, barras ni caracteres de control)
-            std::string text;
-            for (const char* p = buf + prefix_len; *p; ++p) {
-                unsigned char c = (unsigned char)*p;
-                if (c == '"' || c == '\\' || c < 0x20) {
-                    continue;
-                }
-                text.push_back((char)c);
-            }
-            if (text.empty()) {
-                text = "Hola";
+            // El servidor solo acepta la palabra de activación real como texto
+            // (un texto libre da ERROR). Se usa la palabra configurada en Cooper;
+            // el saludo lo hace el agente según su rol en la consola.
+            auto& app = Application::GetInstance();
+            std::string text = "Hi,ESP";
+            auto words = app.GetAudioService().GetWakeWords();
+            if (!words.empty() && !words[0].empty()) {
+                text = words[0];
             }
 
             // Esperar (hasta 60 s) a que Cooper esté en espera
-            auto& app = Application::GetInstance();
             for (int i = 0; i < 60 && app.GetDeviceState() != kDeviceStateIdle; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
