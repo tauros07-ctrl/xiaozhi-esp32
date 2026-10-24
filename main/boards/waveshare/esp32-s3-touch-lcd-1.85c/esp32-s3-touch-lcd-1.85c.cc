@@ -17,6 +17,14 @@
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
 
+// --- Cooper: despertar por la red al prender la PC ---
+#include <esp_netif.h>
+#include <lwip/sockets.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <cstring>
+#include <string>
+
 #define TAG "waveshare_lcd_1_85c"
 
 #define LCD_OPCODE_WRITE_CMD        (0x02ULL)
@@ -211,6 +219,95 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
     {0x29, (uint8_t []){0x00}, 1, 0},  
 };
 
+
+// ---------------------------------------------------------------------------
+// Cooper: escucha un aviso UDP de la PC ("COOPER:<texto>") en el puerto 41234
+// y despierta al asistente como si hubiera oído la palabra de activación,
+// enviando <texto> al servidor para que responda (por ejemplo, un saludo).
+// ---------------------------------------------------------------------------
+#define COOPER_WAKE_PORT 41234
+#define COOPER_WAKE_PREFIX "COOPER:"
+#define COOPER_WAKE_COOLDOWN_US (120LL * 1000000LL)
+
+static void CooperWakeListenerTask(void* arg) {
+    // Esperar a que el Wi-Fi esté conectado antes de usar sockets
+    while (true) {
+        esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif != nullptr && esp_netif_is_netif_up(netif)) {
+            esp_netif_ip_info_t ip = {};
+            if (esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+                break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    int64_t last_wake_us = -COOPER_WAKE_COOLDOWN_US;
+    const size_t prefix_len = strlen(COOPER_WAKE_PREFIX);
+
+    while (true) {
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(COOPER_WAKE_PORT);
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        ESP_LOGI(TAG, "Cooper: escuchando avisos en UDP %d", COOPER_WAKE_PORT);
+
+        char buf[256];
+        while (true) {
+            struct sockaddr_in src = {};
+            socklen_t src_len = sizeof(src);
+            int len = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr*)&src, &src_len);
+            if (len < 0) {
+                break;
+            }
+            buf[len] = '\0';
+            if (strncmp(buf, COOPER_WAKE_PREFIX, prefix_len) != 0) {
+                continue;
+            }
+            int64_t now = esp_timer_get_time();
+            if (now - last_wake_us < COOPER_WAKE_COOLDOWN_US) {
+                ESP_LOGI(TAG, "Cooper: aviso repetido, se ignora");
+                continue;
+            }
+
+            // Limpiar el texto (sin comillas, barras ni caracteres de control)
+            std::string text;
+            for (const char* p = buf + prefix_len; *p; ++p) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\' || c < 0x20) {
+                    continue;
+                }
+                text.push_back((char)c);
+            }
+            if (text.empty()) {
+                text = "Hola";
+            }
+
+            // Esperar (hasta 60 s) a que Cooper esté en espera
+            auto& app = Application::GetInstance();
+            for (int i = 0; i < 60 && app.GetDeviceState() != kDeviceStateIdle; i++) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            if (app.GetDeviceState() == kDeviceStateIdle) {
+                last_wake_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "Cooper: despertando por aviso de la PC");
+                app.WakeWordInvoke(text);
+            }
+        }
+        close(sock);
+    }
+}
+
 class CustomBoard : public WifiBoard {
 private:
     Button boot_button_;
@@ -374,6 +471,7 @@ public:
         Initializest77916Display();
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
+        xTaskCreate(CooperWakeListenerTask, "cooper_wake", 4096, nullptr, 3, nullptr);
     }
 
     #ifdef CONFIG_VERSION_1_0
