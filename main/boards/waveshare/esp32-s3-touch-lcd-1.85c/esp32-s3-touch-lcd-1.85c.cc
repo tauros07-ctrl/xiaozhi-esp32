@@ -4,6 +4,7 @@
 #include "display/lcd_display.h"
 #include "system_reset.h"
 #include "application.h"
+#include "mcp_server.h"
 #include "button.h"
 #include "config.h"
 
@@ -23,6 +24,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <cstring>
+#include <cstdio>
 #include <string>
 
 #define TAG "waveshare_lcd_1_85c"
@@ -304,6 +306,209 @@ static void CooperWakeListenerTask(void* arg) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cooper: panel del clima en pantalla
+// La IA llama a la herramienta "self.screen.show_weather" despues de consultar
+// el pronostico (herramienta "clima" de la PC). El panel tapa la carita unos
+// segundos y despues desaparece solo.
+// ---------------------------------------------------------------------------
+enum CooperWeatherIcon { kWxSun, kWxPartly, kWxCloud, kWxRain, kWxStorm, kWxSnow, kWxFog };
+
+static lv_obj_t* cooper_weather_panel = nullptr;
+static lv_timer_t* cooper_weather_timer = nullptr;
+
+static std::string CooperLower(const std::string& in) {
+    std::string out = in;
+    for (auto& c : out) {
+        if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+    }
+    return out;
+}
+
+static CooperWeatherIcon CooperIconFromText(const std::string& estado) {
+    std::string e = CooperLower(estado);
+    auto has = [&](const char* w) { return e.find(w) != std::string::npos; };
+    if (has("torment") || has("granizo") || has("storm")) return kWxStorm;
+    if (has("niev") || has("nevad") || has("snow")) return kWxSnow;
+    if (has("lluv") || has("llovizna") || has("chaparr") || has("rain")) return kWxRain;
+    if (has("niebla") || has("bruma") || has("fog")) return kWxFog;
+    if (has("parcial") || has("mayormente") || has("algo nublado") || has("partly")) return kWxPartly;
+    if (has("nublado") || has("cubierto") || has("cloud")) return kWxCloud;
+    return kWxSun;
+}
+
+static lv_obj_t* CooperCircle(lv_obj_t* parent, int size, int x, int y, uint32_t color) {
+    lv_obj_t* c = lv_obj_create(parent);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_size(c, size, size);
+    lv_obj_set_style_radius(c, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(c, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+    lv_obj_set_pos(c, x, y);
+    lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    return c;
+}
+
+static lv_obj_t* CooperBar(lv_obj_t* parent, int w, int h, int x, int y, uint32_t color) {
+    lv_obj_t* r = CooperCircle(parent, w, x, y, color);
+    lv_obj_set_size(r, w, h);
+    lv_obj_set_style_radius(r, h / 2, 0);
+    return r;
+}
+
+// Dibuja el icono dentro de una caja de 140 x 110
+static void CooperDrawIcon(lv_obj_t* box, CooperWeatherIcon icon) {
+    const uint32_t kSun = 0xEF9F27, kCloud = 0xD3D1C7, kDark = 0x888780, kRain = 0x85B7EB, kSnow = 0xE6F1FB;
+    bool sun = (icon == kWxSun || icon == kWxPartly);
+    if (sun) {
+        int cx = (icon == kWxSun) ? 70 : 92, cy = (icon == kWxSun) ? 55 : 35;
+        int r = (icon == kWxSun) ? 34 : 24;
+        // rayos: 8 barritas cortas alrededor del sol
+        static const int dx[8] = {0, 7, 10, 7, 0, -7, -10, -7};
+        static const int dy[8] = {-10, -7, 0, 7, 10, 7, 0, -7};
+        for (int i = 0; i < 8; i++) {
+            int px = cx + dx[i] * (r + 12) / 10 - 5;
+            int py = cy + dy[i] * (r + 12) / 10 - 5;
+            CooperCircle(box, 10, px, py, kSun);
+        }
+        CooperCircle(box, r * 2, cx - r, cy - r, kSun);
+        if (icon == kWxSun) return;
+    }
+    if (icon == kWxFog) {
+        CooperBar(box, 110, 12, 15, 30, kCloud);
+        CooperBar(box, 90, 12, 25, 52, kCloud);
+        CooperBar(box, 110, 12, 15, 74, kCloud);
+        return;
+    }
+    uint32_t cloud = (icon == kWxStorm || icon == kWxRain) ? kDark : kCloud;
+    int top = (icon == kWxCloud || icon == kWxPartly) ? 20 : 5;
+    CooperCircle(box, 50, 22, top + 18, cloud);
+    CooperCircle(box, 64, 50, top, cloud);
+    CooperBar(box, 106, 40, 17, top + 34, cloud);
+    if (icon == kWxRain || icon == kWxStorm) {
+        for (int i = 0; i < 3; i++) {
+            CooperBar(box, 8, 20, 38 + i * 26, top + 82, kRain);
+        }
+    }
+    if (icon == kWxStorm) {
+        CooperBar(box, 10, 24, 66, top + 76, kSun);
+    }
+    if (icon == kWxSnow) {
+        for (int i = 0; i < 3; i++) {
+            CooperCircle(box, 12, 38 + i * 26, top + 84, kSnow);
+        }
+    }
+}
+
+static void CooperHideWeather(lv_timer_t* t) {
+    if (cooper_weather_panel) {
+        lv_obj_delete(cooper_weather_panel);
+        cooper_weather_panel = nullptr;
+    }
+    cooper_weather_timer = nullptr;
+}
+
+static void CooperShowWeather(Display* display, const std::string& lugar, const std::string& estado,
+                              int minima, int maxima, int lluvia, int segundos) {
+    DisplayLockGuard lock(display);
+    if (cooper_weather_timer) {
+        lv_timer_delete(cooper_weather_timer);
+        cooper_weather_timer = nullptr;
+    }
+    if (cooper_weather_panel) {
+        lv_obj_delete(cooper_weather_panel);
+        cooper_weather_panel = nullptr;
+    }
+    const lv_font_t* font = lv_obj_get_style_text_font(lv_screen_active(), 0);
+
+    lv_obj_t* panel = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(panel, font, 0);
+    lv_obj_set_style_text_color(panel, lv_color_hex(0xF5A623), 0);
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(panel);
+
+    lv_obj_t* titulo = lv_label_create(panel);
+    lv_label_set_text(titulo, lugar.c_str());
+    lv_obj_set_width(titulo, 240);
+    lv_obj_set_style_text_align(titulo, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(titulo, LV_LABEL_LONG_WRAP);
+    lv_obj_align(titulo, LV_ALIGN_TOP_MID, 0, 46);
+
+    lv_obj_t* icon_box = lv_obj_create(panel);
+    lv_obj_remove_style_all(icon_box);
+    lv_obj_set_size(icon_box, 140, 110);
+    lv_obj_align(icon_box, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_remove_flag(icon_box, LV_OBJ_FLAG_SCROLLABLE);
+    CooperDrawIcon(icon_box, CooperIconFromText(estado));
+
+    lv_obj_t* texto = lv_label_create(panel);
+    lv_label_set_text(texto, estado.c_str());
+    lv_obj_set_width(texto, 260);
+    lv_obj_set_style_text_align(texto, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(texto, LV_LABEL_LONG_WRAP);
+    lv_obj_align(texto, LV_ALIGN_TOP_MID, 0, 196);
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Min %d\xC2\xB0   Max %d\xC2\xB0", minima, maxima);
+    lv_obj_t* temps = lv_label_create(panel);
+    lv_label_set_text(temps, buf);
+    lv_obj_set_style_text_color(temps, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(temps, LV_ALIGN_TOP_MID, 0, 228);
+
+    if (lluvia >= 0) {
+        snprintf(buf, sizeof(buf), "Lluvia %d%%", lluvia);
+        lv_obj_t* ll = lv_label_create(panel);
+        lv_label_set_text(ll, buf);
+        lv_obj_set_style_text_color(ll, lv_color_hex(0x85B7EB), 0);
+        lv_obj_align(ll, LV_ALIGN_TOP_MID, 0, 258);
+    }
+    if (minima <= 0) {
+        lv_obj_t* hel = lv_label_create(panel);
+        lv_label_set_text(hel, "Riesgo de helada");
+        lv_obj_set_style_text_color(hel, lv_color_hex(0xB5D4F4), 0);
+        lv_obj_align(hel, LV_ALIGN_TOP_MID, 0, 288);
+    }
+
+    cooper_weather_panel = panel;
+    cooper_weather_timer = lv_timer_create(CooperHideWeather, segundos * 1000, nullptr);
+    lv_timer_set_repeat_count(cooper_weather_timer, 1);
+}
+
+static void CooperRegisterWeatherTool(Display* display) {
+    auto& mcp = McpServer::GetInstance();
+    mcp.AddTool("self.screen.show_weather",
+        "Muestra en la pantalla de Cooper un panel con el pronostico del tiempo. "
+        "Usarla SIEMPRE que le des a Carlos el clima o el pronostico, justo despues de "
+        "consultar la herramienta 'clima', con los mismos datos. "
+        "lugar: nombre del lugar y el dia, por ejemplo 'Hornillos - mañana'. "
+        "estado: descripcion corta como 'despejado', 'parcialmente nublado', 'nublado', "
+        "'lluvia', 'tormenta', 'nieve' o 'niebla'. "
+        "minima y maxima: temperaturas en grados. lluvia: probabilidad de lluvia en porcentaje "
+        "(-1 si no se sabe). segundos: cuanto tiempo mostrar el panel.",
+        PropertyList({
+            Property("lugar", kPropertyTypeString, std::string("Palpalá")),
+            Property("estado", kPropertyTypeString, std::string("despejado")),
+            Property("minima", kPropertyTypeInteger, -40, 60),
+            Property("maxima", kPropertyTypeInteger, -40, 60),
+            Property("lluvia", kPropertyTypeInteger, -1, -1, 100),
+            Property("segundos", kPropertyTypeInteger, 12, 3, 60),
+        }),
+        [display](const PropertyList& p) -> ReturnValue {
+            CooperShowWeather(display,
+                p["lugar"].value<std::string>(),
+                p["estado"].value<std::string>(),
+                p["minima"].value<int>(),
+                p["maxima"].value<int>(),
+                p["lluvia"].value<int>(),
+                p["segundos"].value<int>());
+            return true;
+        });
+}
+
 class CustomBoard : public WifiBoard {
 private:
     Button boot_button_;
@@ -468,6 +673,7 @@ public:
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
         xTaskCreate(CooperWakeListenerTask, "cooper_wake", 4096, nullptr, 3, nullptr);
+        CooperRegisterWeatherTool(display_);
     }
 
     #ifdef CONFIG_VERSION_1_0
