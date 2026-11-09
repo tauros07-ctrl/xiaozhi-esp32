@@ -419,7 +419,7 @@ static void CooperShowWeather(Display* display, const std::string& lugar, const 
         lv_obj_delete(cooper_weather_panel);
         cooper_weather_panel = nullptr;
     }
-    const lv_font_t* font = lv_obj_get_style_text_font(lv_screen_active(), 0);
+    const lv_font_t* font = lv_obj_get_style_text_font(lv_screen_active(), LV_PART_MAIN);
 
     lv_obj_t* panel = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(panel);
